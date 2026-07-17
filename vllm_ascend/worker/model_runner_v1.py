@@ -718,71 +718,6 @@ class NPUModelRunner(GPUModelRunner):
     def _is_pd_prefill_worker(self) -> bool:
         return self.is_kv_producer and not self.is_kv_consumer
 
-    def _apply_pp_sampled_tokens_from_scheduler_output(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> None:
-        pp = get_pp_group()
-        if (
-            not self.use_async_scheduling
-            or pp.is_last_rank
-            or self._is_pd_prefill_worker()
-        ):
-            return
-
-        self.input_batch.prev_sampled_token_ids = None
-        self.input_batch.prev_req_id_to_index = {}
-
-        req_data = scheduler_output.scheduled_cached_reqs
-        new_token_ids = req_data.new_token_ids
-        if not new_token_ids:
-            return
-
-        num_prev_reqs = self.input_batch.num_reqs
-        if num_prev_reqs == 0:
-            return
-
-        discard_req_indices = np.nonzero(
-            self.discard_request_mask.np[:num_prev_reqs]
-        )[0]
-        discarded = set(discard_req_indices)
-        prev_req_indices = {
-            req_id: req_index
-            for req_index, req_id in enumerate(
-                self.input_batch.req_ids[:num_prev_reqs]
-            )
-            if req_index not in discarded
-        }
-        prev_req_id_to_index: dict[str, int] = {}
-        prev_sampled_token_ids = [PLACEHOLDER_TOKEN_ID] * num_prev_reqs
-
-        for req_index, req_id in enumerate(req_data.req_ids):
-            if req_index >= len(new_token_ids):
-                break
-            token_ids = new_token_ids[req_index]
-            if not token_ids or req_data.num_output_tokens[req_index] <= 0:
-                continue
-            prev_req_index = prev_req_indices.get(req_id)
-            if prev_req_index is None:
-                continue
-            prev_req_id_to_index[req_id] = prev_req_index
-            prev_sampled_token_ids[prev_req_index] = token_ids[-1]
-            if (req_state := self.requests.get(req_id)) is not None:
-                req_state.output_token_ids.append(PLACEHOLDER_TOKEN_ID)
-            pos = self.input_batch.num_tokens_no_spec[prev_req_index]
-            self.input_batch.is_token_ids[prev_req_index, pos] = True
-            self.input_batch.num_tokens_no_spec[prev_req_index] = pos + 1
-
-        if not prev_req_id_to_index:
-            return
-
-        self.input_batch.prev_req_id_to_index = prev_req_id_to_index
-        self.input_batch.prev_sampled_token_ids = torch.tensor(
-            prev_sampled_token_ids,
-            dtype=torch.int32,
-            device=self.device,
-        ).unsqueeze(1)
-
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         # Temporary rewind guard for KV-load-failure recompute.
         # This can be removed after the upstream fix is merged.
@@ -798,7 +733,6 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
         return super()._update_states(scheduler_output)
 
     def _pad_query_start_loc_for_fia(
@@ -2442,6 +2376,57 @@ class NPUModelRunner(GPUModelRunner):
         return None
 
     @torch.inference_mode()
+
+    def _pp_broadcast_prev_sampled_token_ids(self, sampled_token_ids):
+        """Broadcast sampled token ids from last PP stage (Ascend #12060)."""
+        import torch
+        from vllm.distributed.parallel_state import get_pp_group
+
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        if sampled_token_ids is None:
+            return
+        toks = sampled_token_ids
+        if toks.dim() == 1:
+            toks = toks.unsqueeze(-1)
+        elif toks.dim() == 2 and toks.shape[-1] != 1:
+            toks = toks[:, :1].contiguous()
+        # Always participate; parent skip-on-chunked can deadlock if ranks disagree.
+        toks_cpu = toks.detach().to("cpu", dtype=torch.int32).contiguous()
+        group = getattr(pp, "cpu_group", None) or pp.device_group
+        torch.distributed.broadcast(toks_cpu, src=int(pp.rank), group=group)
+
+    def _pp_receive_prev_sampled_token_ids_to_input_batch(self):
+        """Receive sampled token ids from last PP stage (Ascend #12060)."""
+        import torch
+        import numpy as np
+        from vllm.distributed.parallel_state import get_pp_group
+
+        pp = get_pp_group()
+        assert not pp.is_last_rank
+        num_reqs = int(self.input_batch.num_reqs)
+        recv = torch.empty((max(num_reqs, 1), 1), dtype=torch.int32)
+        group = getattr(pp, "cpu_group", None) or pp.device_group
+        torch.distributed.broadcast(recv, src=int(pp.last_rank), group=group)
+        if num_reqs == 0 or self._is_all_reqs_chunked_prefill():
+            return
+        self.input_batch.prev_sampled_token_ids = recv[:num_reqs].to(
+            self.device, non_blocking=True
+        )
+        discard = set(np.nonzero(self.discard_request_mask.np[:num_reqs])[0].tolist())
+        prev_req_id_to_index = {}
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            if i in discard:
+                continue
+            prev_req_id_to_index[req_id] = i
+            if (req_state := self.requests.get(req_id)) is not None:
+                req_state.output_token_ids.append(-1)
+            pos = int(self.input_batch.num_tokens_no_spec[i])
+            if hasattr(self.input_batch, "is_token_ids"):
+                self.input_batch.is_token_ids[i, pos] = True
+            self.input_batch.num_tokens_no_spec[i] = pos + 1
+        self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -2451,6 +2436,9 @@ class NPUModelRunner(GPUModelRunner):
         use_pp_spec_decode = self.speculative_config is not None and pp.world_size > 1
 
         if self.execute_model_state is None:
+            # FIX #12060: async-PP receive (align upstream GPUModelRunner.sample_tokens).
+            if self.use_async_scheduling and not get_pp_group().is_last_rank:
+                self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
                 return None  # noqa
@@ -2672,6 +2660,15 @@ class NPUModelRunner(GPUModelRunner):
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        # FIX #12060: async-PP broadcast (align upstream GPUModelRunner.sample_tokens).
+        pp = get_pp_group()
+        if (
+            self.use_async_scheduling
+            and not self.broadcast_pp_output
+            and pp.world_size > 1
+            and pp.is_last_rank
+        ):
+            self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
